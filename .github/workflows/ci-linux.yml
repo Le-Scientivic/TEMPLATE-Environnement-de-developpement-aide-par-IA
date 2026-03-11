@@ -1,0 +1,210 @@
+# ============================================================
+# CI Linux — Vérification automatique de la qualité du code
+# ============================================================
+#
+# Ce workflow s'exécute automatiquement sur chaque push vers
+# `main` et sur chaque Pull Request vers `main`.
+#
+# Il vérifie :
+#   - La syntaxe et la qualité des fichiers Markdown (markdownlint)
+#   - La syntaxe des fichiers YAML (.github/workflows, etc.)
+#   - La syntaxe des fichiers JSON (s'il en existe)
+#   - Les liens cassés dans la documentation Markdown
+#
+# Runner : ubuntu-latest (Linux, compatible VS Code)
+# ============================================================
+
+name: CI Linux
+
+# Déclencheurs : push sur main et pull_request vers main
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+# Permissions minimales nécessaires
+# - contents: read       → pour checkout du code
+# - pull-requests: write → pour poster des commentaires sur les PR
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  # -------------------------------------------------------
+  # Job 1 : Vérification de la qualité des fichiers
+  # -------------------------------------------------------
+  quality:
+    name: Vérification qualité (Markdown, YAML, JSON)
+    runs-on: ubuntu-latest
+
+    steps:
+      # Étape 1 : Récupérer le code source
+      - name: 📥 Checkout du code
+        uses: actions/checkout@v4
+
+      # Étape 2 : Configurer Node.js (nécessaire pour markdownlint-cli)
+      - name: 🟢 Configurer Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Étape 3 : Installer les outils de vérification
+      - name: 📦 Installer les outils (markdownlint, js-yaml)
+        run: |
+          npm install -g markdownlint-cli
+          npm install -g js-yaml
+
+      # Étape 4 : Vérifier la syntaxe et la qualité des fichiers Markdown
+      - name: 📝 Lint Markdown
+        run: |
+          markdownlint '**/*.md' --ignore node_modules
+        continue-on-error: false
+
+      # Étape 5 : Vérifier la syntaxe des fichiers YAML
+      - name: 🔍 Vérifier la syntaxe YAML
+        run: |
+          find . -name "*.yml" -o -name "*.yaml" | grep -v node_modules | grep -v .git | while read file; do
+            echo "Vérification de : $file"
+            node -e "
+              var yaml = require('js-yaml');
+              var fs = require('fs');
+              try {
+                yaml.load(fs.readFileSync(process.argv[1], 'utf8'));
+                console.log('  OK');
+              } catch(e) {
+                console.error('  Erreur YAML :', e.message);
+                process.exit(1);
+              }
+            " "$file"
+          done
+        continue-on-error: false
+
+      # Étape 6 : Vérifier la syntaxe des fichiers JSON (si présents)
+      - name: 🔍 Vérifier la syntaxe JSON
+        run: |
+          json_files=$(find . -name "*.json" | grep -v node_modules | grep -v .git)
+          if [ -z "$json_files" ]; then
+            echo "Aucun fichier JSON trouvé — vérification ignorée."
+          else
+            echo "$json_files" | while read file; do
+              echo "Vérification de : $file"
+              node -e "
+                var fs = require('fs');
+                try {
+                  JSON.parse(fs.readFileSync(process.argv[1], 'utf8'));
+                  console.log('  OK');
+                } catch(e) {
+                  console.error('  Erreur JSON :', e.message);
+                  process.exit(1);
+                }
+              " "$file"
+            done
+          fi
+        continue-on-error: false
+
+  # -------------------------------------------------------
+  # Job 2 : Vérification des liens dans la documentation
+  # -------------------------------------------------------
+  links:
+    name: Vérification des liens Markdown
+    runs-on: ubuntu-latest
+
+    steps:
+      # Étape 1 : Récupérer le code source
+      - name: 📥 Checkout du code
+        uses: actions/checkout@v4
+
+      # Étape 2 : Vérifier les liens dans les fichiers Markdown
+      - name: 🔗 Vérifier les liens Markdown
+        run: |
+          npm install -g markdown-link-check
+          find . -name "*.md" | grep -v node_modules | grep -v .git | while read file; do
+            echo "Vérification des liens dans : $file"
+            markdown-link-check "$file" \
+              --config .github/mlc_config.json \
+              --quiet
+          done
+
+  # -------------------------------------------------------
+  # Job 3 : Commentaire automatique sur la PR
+  # -------------------------------------------------------
+  # Ce job s'exécute APRÈS les jobs `quality` et `links`
+  # et poste un commentaire sur la PR pour indiquer le résultat.
+  pr-comment:
+    name: Commentaire sur la PR
+    runs-on: ubuntu-latest
+    # Ce job ne s'exécute QUE sur les Pull Requests (pas sur les push directs)
+    # et toujours s'exécute même si les jobs précédents ont échoué
+    if: always() && github.event_name == 'pull_request'
+    # Attendre la fin des deux autres jobs avant de commenter
+    needs: [quality, links]
+
+    steps:
+      - name: 💬 Poster un commentaire de résultat sur la PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const qualityResult = '${{ needs.quality.result }}';
+            const linksResult   = '${{ needs.links.result }}';
+            const allPassed = qualityResult === 'success' && linksResult === 'success';
+            const logsUrl = 'https://github.com/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId;
+
+            const qualityIcon = qualityResult === 'success' ? '✅ Succès' : '❌ Échec';
+            const linksIcon   = linksResult   === 'success' ? '✅ Succès' : '❌ Échec';
+
+            let body;
+            if (allPassed) {
+              body = '## ✅ CI réussie — Prêt pour le merge !\n\n'
+                + 'Tous les checks automatiques ont passé avec succès sur cette Pull Request.\n\n'
+                + '| Check | Résultat |\n'
+                + '|---|---|\n'
+                + '| 📝 Qualité (Markdown, YAML, JSON) | ' + qualityIcon + ' |\n'
+                + '| 🔗 Liens Markdown | ' + linksIcon + ' |\n\n'
+                + '👉 [Voir les logs complets](' + logsUrl + ')\n\n'
+                + '> *Ce commentaire a été posté automatiquement par la CI.*';
+            } else {
+              body = '## ❌ CI échouée — Merci de corriger avant le merge\n\n'
+                + 'Des checks automatiques ont échoué sur cette Pull Request. **Merci de corriger les erreurs avant de merger.**\n\n'
+                + '| Check | Résultat |\n'
+                + '|---|---|\n'
+                + '| 📝 Qualité (Markdown, YAML, JSON) | ' + qualityIcon + ' |\n'
+                + '| 🔗 Liens Markdown | ' + linksIcon + ' |\n\n'
+                + '👉 [Voir les logs pour identifier les erreurs](' + logsUrl + ')\n\n'
+                + '### Que faire ?\n'
+                + '1. Clique sur le lien ci-dessus pour voir les détails des erreurs.\n'
+                + '2. Corrige les erreurs dans ta branche.\n'
+                + '3. La CI se relancera automatiquement après ton prochain push.\n\n'
+                + '> *Ce commentaire a été posté automatiquement par la CI.*';
+            }
+
+            // Chercher un commentaire CI existant pour le mettre à jour
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(function(comment) {
+              return comment.user.type === 'Bot' &&
+                comment.body.includes('Ce commentaire a été posté automatiquement par la CI.');
+            });
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body,
+              });
+            }
